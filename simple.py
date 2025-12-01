@@ -5,6 +5,7 @@ from timm.models.layers import trunc_normal_, DropPath
 from kornia.utils import create_meshgrid
 from einops import rearrange
 import math
+import argparse
 from mamba_ssm import Mamba
 from functools import partial
 try:
@@ -958,7 +959,7 @@ class MLPMixerEncoderLayer(nn.Module):
         x = x + self.mlp2(x)
         return x.transpose(1, 2)
 
-class JamMa(nn.Module):
+class JamMa_Concrete(nn.Module):
     def __init__(self, config, profiler=None):
         super().__init__()
         self.config = config
@@ -1071,4 +1072,115 @@ class JamMa(nn.Module):
             # 5. match fine-level and sub-pixel refinement
             self.fine_matching(feat_f0_unfold.transpose(1, 2), feat_f1_unfold.transpose(1, 2), data)
 
+def read_megadepth_color(path, resize=None, df=None, padding=False):
+    # read image
+    image = Image.open(path)
+    w, h = image.width, image.height
+    w_new, h_new = get_resized_wh(image.width, image.height, resize)
+    w_new, h_new = get_divisible_wh(w_new, h_new, df)
+    scale = torch.tensor([w/w_new, h/h_new], dtype=torch.float)
+    resize_fun = transforms.Resize((h_new, w_new), InterpolationMode.BICUBIC)
+    image = resize_fun(image)
+    image = np.array(image, dtype=np.float32)
+    if len(image.shape) == 2:
+        image = np.repeat(image[..., np.newaxis], 3, axis=2)
+    image = image.transpose((2, 0, 1))
+    image /= 255.0
+    image = torch.from_numpy(image)
+    Normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    image = Normalize(image).numpy()
 
+    if padding:  # padding
+        pad_to = max(h_new, w_new)
+        image, mask = pad_bottom_right(image, pad_to, ret_mask=True)
+        mask = torch.from_numpy(mask[0])
+    else:
+        mask = None
+
+    image = torch.from_numpy(image).float()[None]
+
+    return image, scale, mask, torch.tensor([h_new, w_new])
+
+class JamMa_Abstract(nn.Module):
+    def __init__(self, config, pretrained='official') -> None:
+        super().__init__()
+        self.backbone = CovNextV2_nano()
+        self.matcher = JamMa_Concrete(config)
+
+        if pretrained == 'official':
+            state_dict = torch.hub.load_state_dict_from_url(
+                'https://github.com/leoluxxx/JamMa/releases/download/v0.1/jamma.ckpt',
+                file_name='jamma.ckpt')['state_dict']
+            self.load_state_dict(state_dict, strict=True)
+            logger.info(f"Load Official JamMa Weight")
+        elif pretrained:
+            state_dict = torch.load(pretrained, map_location='cpu')['state_dict']
+            self.load_state_dict(state_dict, strict=True)
+            logger.info(f"Load \'{pretrained}\' as pretrained checkpoint")
+
+    def forward(self, data):
+        self.backbone(data)
+        return self.matcher(data)
+
+def main():
+    cfg = {
+        'coarse': {
+            'd_model': 256,
+        },
+        'fine': {
+            'd_model': 64,
+            'dsmax_temperature': 0.1,
+            'thr': 0.1,
+            'inference': True
+        },
+        'match_coarse': {
+            'thr': 0.2,
+            'use_sm': True,
+            'border_rm': 2,
+            'dsmax_temperature': 0.1,
+            'inference': True
+        },
+        'fine_window_size': 5,
+        'resolution': [8, 2]
+    }
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
+
+    #make sure to include valid paths to your images
+    parser = argparse.ArgumentParser(
+        description='Image pair matching with JamMa',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument(
+        '--image1', type=str, default='../assets/figs/345822933_b5fb7b6feb_o.jpg',
+        help='Path to the source image')
+    parser.add_argument(
+        '--image2', type=str, default='../assets/figs/479605349_8aa68e066d_o.jpg',
+        help='Path to the target image')
+    parser.add_argument(
+        '--output_dir', type=str, default='output/',
+        help='Path of the outputs')
+    
+    opt = parser.parse_args()
+    
+    jamma = JamMa_Abstract(config=cfg).eval().to(device)
+
+    image0, scale0, mask0, prepad_size0 = read_megadepth_color(opt.image1, 832, 16, True)
+    image1, scale1, mask1, prepad_size1 = read_megadepth_color(opt.image2, 832, 16, True)
+
+    mask0 = F.interpolate(mask0[None, None].float(), scale_factor=0.125, mode='nearest', recompute_scale_factor=False)[0].bool()
+    mask1 = F.interpolate(mask1[None, None].float(), scale_factor=0.125, mode='nearest', recompute_scale_factor=False)[0].bool()
+    data = {
+        'imagec_0': image0.to(device),
+        'imagec_1': image1.to(device),
+        'mask0': mask0.to(device),
+        'mask1': mask1.to(device),
+    }
+
+    jamma(data)
+
+if __name__ == "__main__":
+    main()
