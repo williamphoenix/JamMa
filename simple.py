@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as transforms
+from torchvision.transforms.functional import InterpolationMode
+import numpy as np
 from timm.models.layers import trunc_normal_, DropPath
 from kornia.utils import create_meshgrid
 from einops import rearrange
@@ -14,10 +17,45 @@ except ImportError:
     RMSNorm, LayerNorm = None, None
 from pytorch_lightning.profiler import SimpleProfiler, PassThroughProfiler
 from loguru import logger
+from PIL import Image
 
 torch.backends.cudnn.deterministic = True
 INF = 1e9
 
+def pad_bottom_right(inp, pad_size, ret_mask=False):
+    assert isinstance(pad_size, int) and pad_size >= max(inp.shape[-2:]), f"{pad_size} < {max(inp.shape[-2:])}"
+    mask = None
+    if inp.ndim == 2:
+        padded = np.zeros((pad_size, pad_size), dtype=inp.dtype)
+        padded[:inp.shape[0], :inp.shape[1]] = inp
+        if ret_mask:
+            mask = np.zeros((pad_size, pad_size), dtype=bool)
+            mask[:inp.shape[0], :inp.shape[1]] = True
+    elif inp.ndim == 3:
+        padded = np.zeros((inp.shape[0], pad_size, pad_size), dtype=inp.dtype)
+        padded[:, :inp.shape[1], :inp.shape[2]] = inp
+        if ret_mask:
+            mask = np.zeros((inp.shape[0], pad_size, pad_size), dtype=bool)
+            mask[:, :inp.shape[1], :inp.shape[2]] = True
+    else:
+        raise NotImplementedError()
+    return padded, mask
+
+def get_resized_wh(w, h, resize=None):
+    if resize is not None:  # resize the longer edge
+        scale = resize / max(h, w)
+        w_new, h_new = int(round(w*scale)), int(round(h*scale))
+    else:
+        w_new, h_new = w, h
+    return w_new, h_new
+
+
+def get_divisible_wh(w, h, df=None):
+    if df is not None:
+        w_new, h_new = map(lambda x: int(x // df * df), [w, h])
+    else:
+        w_new, h_new = w, h
+    return w_new, h_new
 
 class LayerNorm(nn.Module):
     """ LayerNorm that supports two data formats: channels_last (default) or channels_first.
@@ -60,7 +98,7 @@ class GRN(nn.Module):
         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
         return self.gamma * (x * Nx) + self.beta + x
 
-class Block(nn.Module):
+class ConvNeXtBlock(nn.Module):
     """ ConvNeXtV2 Block.
 
     Args:
@@ -128,7 +166,7 @@ class ConvNeXtV2(nn.Module):
         cur = 0
         for i in range(4):
             stage = nn.Sequential(
-                *[Block(dim=dims[i], drop_path=dp_rates[cur + j]) for j in range(depths[i])]
+                *[ConvNeXtBlock(dim=dims[i], drop_path=dp_rates[cur + j]) for j in range(depths[i])]
             )
             self.stages.append(stage)
             cur += depths[i]
@@ -217,6 +255,27 @@ class CovNextV2_nano(nn.Module):
             'feat_4_1': feat_4_1,
             'grid_8': grid_8,
         })
+
+class TransLN(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.ln = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        return self.ln(x.transpose(1,2)).transpose(1,2)
+
+def MLP(channels: list, do_bn=True):
+    """ Multi-layer perceptron """
+    n = len(channels)
+    layers = []
+    for i in range(1, n):
+        layers.append(
+            nn.Conv1d(channels[i - 1], channels[i], kernel_size=1, bias=True))
+        if i < (n-1):
+            if do_bn:
+                layers.append(TransLN(channels[i]))
+            layers.append(nn.GELU())
+    return nn.Sequential(*layers)
 
 class GLU_3(nn.Module):
     def __init__(self, dim, mid_dim):
@@ -1155,10 +1214,10 @@ def main():
         description='Image pair matching with JamMa',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument(
-        '--image1', type=str, default='../assets/figs/345822933_b5fb7b6feb_o.jpg',
+        '--image1', type=str, default='assets/figs/345822933_b5fb7b6feb_o.jpg',
         help='Path to the source image')
     parser.add_argument(
-        '--image2', type=str, default='../assets/figs/479605349_8aa68e066d_o.jpg',
+        '--image2', type=str, default='assets/figs/479605349_8aa68e066d_o.jpg',
         help='Path to the target image')
     parser.add_argument(
         '--output_dir', type=str, default='output/',
